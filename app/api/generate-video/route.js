@@ -1,74 +1,102 @@
 import { createClient } from "@supabase/supabase-js";
+import { fal } from "@fal-ai/client";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
+  process.env.SUPABASE_SERVICE_KEY // secret key, never exposed to frontend
 );
 
-const OWNER_EMAIL = "northchicagorp0@gmail.com";
+fal.config({ credentials: process.env.FAL_API_KEY });
 
-export async function GET(req) {
-  // Verify owner via auth header (user ID passed from frontend)
-  const userId = req.headers.get("x-user-id");
-  const userEmail = req.headers.get("x-user-email");
-
-  if (!userId || userEmail?.toLowerCase() !== OWNER_EMAIL.toLowerCase()) {
-    return Response.json({ error: "Unauthorized" }, { status: 401 });
-  }
-
+export async function POST(req) {
   try {
-    // ── Real user list from profiles ──────────────────
-    const { data: profiles } = await supabase
-      .from("profiles")
-      .select("id, email, is_pro, created_at")
-      .order("created_at", { ascending: false });
+    const { prompt, userId, isPro } = await req.json();
 
-    // ── Total video generations ───────────────────────
-    const { count: totalVideos } = await supabase
-      .from("video_history")
-      .select("*", { count: "exact", head: true });
+    if (!prompt || !userId) {
+      return Response.json({ error: "Missing prompt or user ID" }, { status: 400 });
+    }
 
-    // ── Videos generated this week ────────────────────
-    const weekAgo = new Date();
-    weekAgo.setDate(weekAgo.getDate() - 7);
-    const { count: videosThisWeek } = await supabase
-      .from("video_history")
-      .select("*", { count: "exact", head: true })
-      .gte("created_at", weekAgo.toISOString());
+    // ── Check usage limit for free users ──────────────
+    if (!isPro) {
+      const now = new Date();
+      const { data: usage, error: usageErr } = await supabase
+        .from("video_usage")
+        .select("*")
+        .eq("user_id", userId)
+        .single();
 
-    // ── New signups this week ─────────────────────────
-    const { count: newUsersThisWeek } = await supabase
-      .from("profiles")
-      .select("*", { count: "exact", head: true })
-      .gte("created_at", weekAgo.toISOString());
+      if (usageErr && usageErr.code !== "PGRST116") {
+        return Response.json({ error: "Usage check failed" }, { status: 500 });
+      }
 
-    // ── Pro users ─────────────────────────────────────
-    const { count: proUsers } = await supabase
-      .from("profiles")
-      .select("*", { count: "exact", head: true })
-      .eq("is_pro", true);
+      if (usage) {
+        const resetDate = new Date(usage.reset_date);
+        const count = now > resetDate ? 0 : usage.count;
 
-    // ── Recent video history (last 10) ────────────────
-    const { data: recentVideos } = await supabase
-      .from("video_history")
-      .select("user_id, prompt, model, created_at")
-      .order("created_at", { ascending: false })
-      .limit(10);
+        if (count >= 2) {
+          return Response.json({
+            error: "FREE_LIMIT",
+            message: "You've used your 2 free videos this month. Upgrade to Pro for unlimited videos!"
+          }, { status: 403 });
+        }
 
-    return Response.json({
-      stats: {
-        totalUsers: profiles?.length || 0,
-        newUsersThisWeek: newUsersThisWeek || 0,
-        totalVideos: totalVideos || 0,
-        videosThisWeek: videosThisWeek || 0,
-        proUsers: proUsers || 0,
-      },
-      users: profiles || [],
-      recentVideos: recentVideos || []
+        // Update count
+        const newCount = now > resetDate ? 1 : count + 1;
+        const newReset = now > resetDate
+          ? new Date(now.getFullYear(), now.getMonth() + 1, 1).toISOString()
+          : usage.reset_date;
+
+        await supabase.from("video_usage").update({
+          count: newCount,
+          reset_date: newReset
+        }).eq("user_id", userId);
+
+      } else {
+        // First time — create record
+        const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+        await supabase.from("video_usage").insert({
+          user_id: userId,
+          count: 1,
+          reset_date: nextMonth.toISOString()
+        });
+      }
+    }
+
+    // ── Generate video via Fal.ai ─────────────────────
+    // Pro users get the stronger Kling 1.6 Pro model
+    // Free users get Kling 1.5 standard
+    const model = isPro
+      ? "fal-ai/kling-video/v1.6/pro/text-to-video"
+      : "fal-ai/kling-video/v1.5/standard/text-to-video";
+
+    const result = await fal.subscribe(model, {
+      input: {
+        prompt,
+        duration: isPro ? "10" : "5",
+        aspect_ratio: "16:9",
+        negative_prompt: "blur, distortion, watermark, text overlay, low quality, artifacts, shaky, overexposed"
+      }
     });
 
+    const videoUrl = result.data?.video?.url;
+    if (!videoUrl) {
+      return Response.json({ error: "Video generation failed" }, { status: 500 });
+    }
+
+    // ── Save to Supabase history ──────────────────────
+    await supabase.from("video_history").insert({
+      user_id: userId,
+      prompt,
+      video_url: videoUrl,
+      model: isPro ? "Kling Pro 1.6" : "Kling Standard 1.5",
+      is_pro: isPro,
+      created_at: new Date().toISOString()
+    });
+
+    return Response.json({ videoUrl, model: isPro ? "Kling Pro 1.6" : "Kling Standard 1.5" });
+
   } catch (err) {
-    console.error("Admin fetch error:", err);
+    console.error("Video generation error:", err);
     return Response.json({ error: "Server error" }, { status: 500 });
   }
 }
