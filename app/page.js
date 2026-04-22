@@ -1,3 +1,7 @@
+import fs from 'fs'
+import path from 'path'
+
 export default function Page() {
-  return null
+  const html = fs.readFileSync(path.join(process.cwd(), 'public/index.html'), 'utf8')
+  return <div dangerouslySetInnerHTML={{ __html: html }} />
 }
